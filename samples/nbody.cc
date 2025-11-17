@@ -8,8 +8,8 @@
 
 namespace param {
 const int n_steps = 200000;
-const double dt = 60;
-const double eps = 1e-3;
+const double dt = 60;  // time step in seconds
+const double eps = 1e-3;  // soften parameter to avoid singularities
 const double G = 6.674e-11;
 double gravity_device_mass(double m0, double t) {
     return m0 + 0.5 * m0 * fabs(sin(t / 6000));
@@ -48,11 +48,12 @@ void write_output(const char* filename, double min_dist, int hit_time_step,
          << gravity_device_id << ' ' << missile_cost << '\n';
 }
 
+// oen step of the simulation
 void run_step(int step, int n, std::vector<double>& qx, std::vector<double>& qy,
     std::vector<double>& qz, std::vector<double>& vx, std::vector<double>& vy,
     std::vector<double>& vz, const std::vector<double>& m,
     const std::vector<std::string>& type) {
-    // compute accelerations
+    // compute accelerations between each pair of bodies
     std::vector<double> ax(n), ay(n), az(n);
     for (int i = 0; i < n; i++) {
         for (int j = 0; j < n; j++) {
@@ -102,7 +103,7 @@ int main(int argc, char** argv) {
         return sqrt(dx * dx + dy * dy + dz * dz);
     };
 
-    // Problem 1
+    // Problem 1, calculate minimum distance between planet and asteroid
     double min_dist = std::numeric_limits<double>::infinity();
     read_input(argv[1], n, planet, asteroid, qx, qy, qz, vx, vy, vz, m, type);
     for (int i = 0; i < n; i++) {
@@ -120,7 +121,7 @@ int main(int argc, char** argv) {
         min_dist = std::min(min_dist, sqrt(dx * dx + dy * dy + dz * dz));
     }
 
-    // Problem 2
+    // Problem 2, find first time step when asteroid hits planet
     int hit_time_step = -2;
     read_input(argv[1], n, planet, asteroid, qx, qy, qz, vx, vy, vz, m, type);
     for (int step = 0; step <= param::n_steps; step++) {
@@ -136,7 +137,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Problem 3
+    // Problem 3, find device id and missile cost to prevent collision
     // TODO
     int gravity_device_id = -999;
     double missile_cost = -999;
