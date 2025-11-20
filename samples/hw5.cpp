@@ -19,175 +19,182 @@ const double missile_speed = 1e6;
 double get_missile_cost(double t) { return 1e5 + 1e3 * t; }
 }  // namespace param
 
-void read_input(const char* filename, int& n, int& planet, int& asteroid,
-    std::vector<double>& qx, std::vector<double>& qy, std::vector<double>& qz,
-    std::vector<double>& vx, std::vector<double>& vy, std::vector<double>& vz,
-    std::vector<double>& m, std::vector<std::string>& type) {
-    std::ifstream fin(filename);
-    fin >> n >> planet >> asteroid;
-    qx.resize(n);
-    qy.resize(n);
-    qz.resize(n);
-    vx.resize(n);
-    vy.resize(n);
-    vz.resize(n);
-    m.resize(n);
-    type.resize(n);
-    for (int i = 0; i < n; i++) {
-        fin >> qx[i] >> qy[i] >> qz[i] >> vx[i] >> vy[i] >> vz[i] >> m[i] >> type[i];
+struct ParticleSystem {
+    int n;
+    int planet;
+    int asteroid;
+
+    std::vector<double> qx, qy, qz;
+    std::vector<double> vx, vy, vz;
+    std::vector<double> m;
+
+    std::vector<bool> is_device;
+    std::vector<int> device_ids;
+
+    void resize(int size) {
+        n = size;
+        qx.resize(size); qy.resize(size); qz.resize(size);
+        vx.resize(size); vy.resize(size); vz.resize(size);
+        m.resize(size);
+        is_device.resize(size, false);
     }
+
+    double disSquared(int i, int j) const {
+        double dx = qx[i] - qx[j];
+        double dy = qy[i] - qy[j];
+        double dz = qz[i] - qz[j];
+        return dx * dx + dy * dy + dz * dz;
+    }
+
+    double distance(int i, int j) const {
+        return std::sqrt(disSquared(i, j));
+    }
+};
+
+inline double get_device_mass(double m0, double t) {
+    return m0 + 0.5 * m0 * fabs(sin(t / 6000));
+}
+
+ParticleSystem read_input(const char* filename) {
+    std::ifstream fin(filename);
+
+    ParticleSystem s;
+    int n, planet, asteroid;
+    fin >> n >> planet >> asteroid;
+
+    s.resize(n);
+    s.planet = planet;
+    s.asteroid = asteroid;
+
+    for (int i = 0; i < n; i++) {
+        std::string type;
+        fin >> s.qx[i] >> s.qy[i] >> s.qz[i]
+            >> s.vx[i] >> s.vy[i] >> s.vz[i]
+            >> s.m[i] >> type;
+
+        if (type == "device") {
+            s.is_device[i] = true;
+            s.device_ids.push_back(i);
+        } else {
+            s.is_device[i] = false;
+        }
+    }
+    return s;
 }
 
 void write_output(const char* filename, double min_dist, int hit_time_step,
     int gravity_device_id, double missile_cost) {
     std::ofstream fout(filename);
-    fout << std::scientific
-         << std::setprecision(std::numeric_limits<double>::digits10 + 1) << min_dist
-         << '\n'
+    fout << std::scientific << std::setprecision(std::numeric_limits<double>::digits10 + 1) 
+         << min_dist << '\n'
          << hit_time_step << '\n'
          << gravity_device_id << ' ' << missile_cost << '\n';
 }
 
-// oen step of the simulation
-void run_step(int step, int n, std::vector<double>& qx, std::vector<double>& qy,
-    std::vector<double>& qz, std::vector<double>& vx, std::vector<double>& vy,
-    std::vector<double>& vz, const std::vector<double>& m,
-    const std::vector<std::string>& type) {
-    // compute accelerations between each pair of bodies
-    std::vector<double> ax(n), ay(n), az(n);
+void run_step(ParticleSystem& s, int step) {
+    int n = s.n;
+    std::vector<double> ax(n, 0.0), ay(n, 0.0), az(n, 0.0);
     for (int i = 0; i < n; i++) {
         for (int j = 0; j < n; j++) {
-            if (j == i) continue;
-            double mj = m[j];
-            if (type[j] == "device")
-                mj = param::gravity_device_mass(mj, step * param::dt);
+            if (i == j) continue;
+
+            double dx = s.qx[j] - s.qx[i];
+            double dy = s.qy[j] - s.qy[i];
+            double dz = s.qz[j] - s.qz[i];
             
-            double dx = qx[j] - qx[i];
-            double dy = qy[j] - qy[i];
-            double dz = qz[j] - qz[i];
-            double dist3 =
-                pow(dx * dx + dy * dy + dz * dz + param::eps * param::eps, 1.5);
-            ax[i] += param::G * mj * dx / dist3;
-            ay[i] += param::G * mj * dy / dist3;
-            az[i] += param::G * mj * dz / dist3;
+            double r2 = dx*dx + dy*dy + dz*dz + param::eps*param::eps;
+            double r = std::sqrt(r2);
+            double r3 = r * r2;
+
+            double mj = s.m[j];
+            if (s.is_device[j] && mj > 0) {
+                mj = get_device_mass(mj, step * param::dt);
+            }
+
+            double f = param::G * mj / r3;
+            ax[i] += f * dx;
+            ay[i] += f * dy;
+            az[i] += f * dz;
         }
     }
 
-    // update velocities
     for (int i = 0; i < n; i++) {
-        vx[i] += ax[i] * param::dt;
-        vy[i] += ay[i] * param::dt;
-        vz[i] += az[i] * param::dt;
-    }
+        s.vx[i] += ax[i] * param::dt;
+        s.vy[i] += ay[i] * param::dt;
+        s.vz[i] += az[i] * param::dt;
 
-    // update positions
-    for (int i = 0; i < n; i++) {
-        qx[i] += vx[i] * param::dt;
-        qy[i] += vy[i] * param::dt;
-        qz[i] += vz[i] * param::dt;
+        s.qx[i] += s.vx[i] * param::dt;
+        s.qy[i] += s.vy[i] * param::dt;
+        s.qz[i] += s.vz[i] * param::dt;
     }
 }
 
-int main(int argc, char** argv) {
-    if (argc != 3)
-        throw std::runtime_error("must supply 2 arguments");
-
-    int n, planet, asteroid;
-    std::vector<double> qx, qy, qz, vx, vy, vz, m;
-    std::vector<std::string> type;
-
-    auto distance = [&](int i, int j) -> double {
-        double dx = qx[i] - qx[j];
-        double dy = qy[i] - qy[j];
-        double dz = qz[i] - qz[j];
-        return sqrt(dx * dx + dy * dy + dz * dz);
-    };
-
-    // Problem 1, calculate minimum distance between planet and asteroid
-    std::vector<int> device_ids;
+double solve_problem1(ParticleSystem s) {
     double min_dist = std::numeric_limits<double>::infinity();
-    read_input(argv[1], n, planet, asteroid, qx, qy, qz, vx, vy, vz, m, type);
-
-    std::vector<double> qx_orig = qx, qy_orig = qy, qz_orig = qz;
-    std::vector<double> vx_orig = vx, vy_orig = vy, vz_orig = vz;
-    std::vector<double> m_orig = m;
-
-    
-    for (int i = 0; i < n; i++) {
-        if (type[i] == "device") {
-            m[i] = 0;
-            device_ids.push_back(i);
-        }
+    for (int id : s.device_ids) {
+        s.m[id] = 0;
     }
+    
     for (int step = 0; step <= param::n_steps; step++) {
         if (step > 0) 
-            run_step(step, n, qx, qy, qz, vx, vy, vz, m, type);
+            run_step(s, step);
     
-        double dx = qx[planet] - qx[asteroid];
-        double dy = qy[planet] - qy[asteroid];
-        double dz = qz[planet] - qz[asteroid];
-        min_dist = std::min(min_dist, distance(planet, asteroid));
+        double d2 = s.disSquared(s.planet, s.asteroid);
+        if (d2 < min_dist)
+            min_dist = d2;
     }
+    return std::sqrt(min_dist);
+}
 
-    // Problem 2, find first time step when asteroid hits planet
-    int hit_time_step = -2;
-    read_input(argv[1], n, planet, asteroid, qx, qy, qz, vx, vy, vz, m, type);
-    for (int step = 0; step <= param::n_steps; step++) {
-        if (step > 0) 
-            run_step(step, n, qx, qy, qz, vx, vy, vz, m, type);
+double sovle_problem2(ParticleSystem s) {
+    double r2 = param::planet_radius * param::planet_radius;
+    if (s.disSquared(s.planet, s.asteroid) < r2)
+        return 0;
+
+    for (int step = 1; step <= param::n_steps; step++) {
+        run_step(s, step);
     
-        double dx = qx[planet] - qx[asteroid];
-        double dy = qy[planet] - qy[asteroid];
-        double dz = qz[planet] - qz[asteroid];
-        if (dx * dx + dy * dy + dz * dz < param::planet_radius * param::planet_radius) {
-            hit_time_step = step;
-            break;
+        if (s.disSquared(s.planet, s.asteroid) < r2) {
+            return step;
         }
     }
+    return -2;
+}
 
-    // Problem 3, find device id and missile cost to prevent collision
+std::pair<int, double> solve_problem3(ParticleSystem& initial_s, int hit_time_step) {
+    if (hit_time_step == -2)
+        return {-1, 0.0};
+    
     int best_device_id = -1;
     double min_missile_cost = std::numeric_limits<double>::infinity();
-    if (hit_time_step == -2) {  // no collision detected
-        write_output(argv[2], min_dist, hit_time_step, -1, 0);
-        return 0;
-    }
+    double r2 = param::planet_radius * param::planet_radius;
 
-    for (int id: device_ids) {
-        qx = qx_orig;
-        qy = qy_orig;
-        qz = qz_orig;
-        vx = vx_orig;
-        vy = vy_orig;
-        vz = vz_orig;
-        m = m_orig;
+    for (int id: initial_s.device_ids) {
+        ParticleSystem s = initial_s;
 
         bool destroyed = false;
         int destroy_step = -1;
         bool hit_planet = false;
 
         for (int step = 0; step <= param::n_steps; step++) {
+            // missle logic
             if (!destroyed) {
-                double dist = distance(planet, id);
+                double dist = s.distance(s.planet, id);
                 double missle_travel_dist = param::missile_speed * (step+1) * param::dt;
                 if (missle_travel_dist >= dist) {  // device destroyed
                     destroyed = true;
                     destroy_step = step;
-                    m[id] = 0;
+                    s.m[id] = 0;
                 }
             }
 
             if (step > 0) 
-                run_step(step, n, qx, qy, qz, vx, vy, vz, m, type);
+                run_step(s, step);
 
-            double dist_planet_asteroid = distance(planet, asteroid);
-            if (dist_planet_asteroid < param::planet_radius) {
+            // collision check
+            if (s.disSquared(s.planet, s.asteroid) < r2) {
                 hit_planet = true;
-                
-                if (dist_planet_asteroid < min_missile_cost) {
-                    hit_planet = true;
-                    break;
-                }
+                break;  // fail attempt
             }
         }
 
@@ -199,9 +206,22 @@ int main(int argc, char** argv) {
             }
         }
     }
-
     if (best_device_id == -1)
-        min_missile_cost = 0;
-    
+        min_missile_cost = 0.0;
+
+    return {best_device_id, min_missile_cost};
+}
+
+int main(int argc, char** argv) {
+    if (argc != 3)
+        throw std::runtime_error("must supply 2 arguments");
+
+    ParticleSystem initial_s = read_input(argv[1]);
+
+    double min_dist = solve_problem1(initial_s);
+    int hit_time_step = sovle_problem2(initial_s);
+    auto [best_device_id, min_missile_cost] = solve_problem3(initial_s, hit_time_step);
+
     write_output(argv[2], min_dist, hit_time_step, best_device_id, min_missile_cost);
+    return 0;
 }
