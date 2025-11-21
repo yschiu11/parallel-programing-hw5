@@ -1,3 +1,4 @@
+#include <hip/hip_runtime.h>
 #include <cmath>
 #include <fstream>
 #include <iomanip>
@@ -5,232 +6,369 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <iostream>
+#include <thread>
+#include <algorithm>
+#include <chrono>
 
 namespace param {
     const int n_steps = 200000;
-    const double dt = 60;  // time step in seconds
-    const double eps = 1e-3;  // soften parameter to avoid singularities
-    const double eps2 = eps * eps;
+    const double dt = 60.0;
+    const double eps2 = 1e-6;
     const double G = 6.674e-11;
-    double gravity_device_mass(double m0, double t) {
-        return m0 + 0.5 * m0 * fabs(sin(t / 6000));
-    }
     const double planet_radius = 1e7;
     const double missile_speed = 1e6;
-    double get_missile_cost(double t) { return 1e5 + 1e3 * t; }
-}  // namespace param
+    
+    inline double get_missile_cost(double t) { return 1e5 + 1e3 * t; }
+}
+
+#define CHECK_HIP(error) \
+    if (error != hipSuccess) { \
+        fprintf(stderr, "HIP Error: %s at %s:%d\n", hipGetErrorString(error), __FILE__, __LINE__); \
+        exit(EXIT_FAILURE); \
+    }
 
 struct ParticleSystem {
-    int n;
-    int planet;
-    int asteroid;
-
-    std::vector<double> qx, qy, qz;
-    std::vector<double> vx, vy, vz;
-    std::vector<double> m;
-
-    std::vector<bool> is_device;
+    int n, planet, asteroid;
+    std::vector<double> qx, qy, qz, vx, vy, vz, m;
+    std::vector<char> is_device; // Optimized: bool -> char
     std::vector<int> device_ids;
-
-    void resize(int size) {
-        n = size;
-        qx.resize(size); qy.resize(size); qz.resize(size);
-        vx.resize(size); vy.resize(size); vz.resize(size);
-        m.resize(size);
-        is_device.resize(size, false);
-    }
-
-    void reset_to(const ParticleSystem& init) {
-        qx = init.qx; qy = init.qy; qz = init.qz;
-        vx = init.vx; vy = init.vy; vz = init.vz;
-        m = init.m;
-    }
-
-    double disSquared(int i, int j) const {
-        double dx = qx[i] - qx[j];
-        double dy = qy[i] - qy[j];
-        double dz = qz[i] - qz[j];
-        return dx * dx + dy * dy + dz * dz;
-    }
-
-    double distance(int i, int j) const {
-        return std::sqrt(disSquared(i, j));
-    }
 };
 
-inline double get_device_mass(double m0, double t) {
-    return m0 + 0.5 * m0 * fabs(sin(t / 6000));
+struct SimResult {
+    int collision_step;    // -2: no collision, >=0: step
+    int missile_hit_step;  // -1: miss, >=0: step
+    double min_dist_sq;    // For Problem 1
+};
+
+struct DeviceData {
+    int n;
+    // Physics State
+    double *qx, *qy, *qz;
+    double *vx, *vy, *vz;
+    double *m;
+    char *is_device;
+
+    // Backup for P3 Reset
+    double *qx0, *qy0, *qz0;
+    double *vx0, *vy0, *vz0;
+    double *m0; // Mass also needs reset in P3 because logic kernel modifies it
+
+    // Simulation Status (Device Side)
+    SimResult* d_result;
+};
+
+__device__ inline double get_mass_gpu(double m0, double t) {
+    return m0 + 0.5 * m0 * fabs(sin(t / 6000.0));
 }
+
+__global__ void k_compute_forces(
+    int n, 
+    const double* __restrict__ qx, const double* __restrict__ qy, const double* __restrict__ qz,
+    const double* __restrict__ m, 
+    const char* __restrict__ is_device,
+    double* __restrict__ ax, double* __restrict__ ay, double* __restrict__ az,
+    double t) 
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
+    double my_qx = qx[i], my_qy = qy[i], my_qz = qz[i];
+    double acc_x = 0.0, acc_y = 0.0, acc_z = 0.0;
+
+    for (int j = 0; j < n; j++) {
+        if (i == j) continue;
+        double dx = qx[j] - my_qx;
+        double dy = qy[j] - my_qy;
+        double dz = qz[j] - my_qz;
+        double r2 = dx*dx + dy*dy + dz*dz + param::eps2;
+        double r_inv = rsqrt(r2);
+        double r3_inv = r_inv * r_inv * r_inv;
+
+        double mj = m[j];
+        if (mj > 0.0 && is_device[j]) {
+            mj = get_mass_gpu(mj, t);
+        }
+
+        double f = param::G * mj * r3_inv;
+        acc_x += f * dx;
+        acc_y += f * dy;
+        acc_z += f * dz;
+    }
+    ax[i] = acc_x; ay[i] = acc_y; az[i] = acc_z;
+}
+
+__global__ void k_update_physics(
+    int n, double dt,
+    double* qx, double* qy, double* qz,
+    double* vx, double* vy, double* vz,
+    const double* ax, const double* ay, const double* az) 
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    vx[i] += ax[i] * dt; vy[i] += ay[i] * dt; vz[i] += az[i] * dt;
+    qx[i] += vx[i] * dt; qy[i] += vy[i] * dt; qz[i] += vz[i] * dt;
+}
+
+__global__ void k_logic_check(
+    int n, int step, int planet, int asteroid, int target_id,
+    const double* qx, const double* qy, const double* qz,
+    double* m,
+    SimResult* result) 
+{
+    if (threadIdx.x != 0 || blockIdx.x != 0) return; // Serial execution on GPU
+
+    // 1. P1 Min Distance Check
+    double dx = qx[planet] - qx[asteroid];
+    double dy = qy[planet] - qy[asteroid];
+    double dz = qz[planet] - qz[asteroid];
+    double d2 = dx*dx + dy*dy + dz*dz;
+    
+    // AtomicMin for double is tricky, but single thread logic avoids race conditions here
+    if (d2 < result->min_dist_sq) {
+        result->min_dist_sq = d2;
+    }
+
+    // 2. P2 Collision Check
+    if (result->collision_step == -2 && d2 < (param::planet_radius * param::planet_radius)) {
+        result->collision_step = step;
+    }
+
+    // 3. P3 Missile Logic
+    if (target_id != -1 && result->missile_hit_step == -1) {
+        double tdx = qx[planet] - qx[target_id];
+        double tdy = qy[planet] - qy[target_id];
+        double tdz = qz[planet] - qz[target_id];
+        double dist_planet_target = sqrt(tdx*tdx + tdy*tdy + tdz*tdz);
+        
+        double missile_dist = (double)(step + 1) * param::dt * param::missile_speed;
+        
+        if (missile_dist >= dist_planet_target) {
+            result->missile_hit_step = step;
+            m[target_id] = 0.0; // destroy device, modify Global Memory
+        }
+    }
+}
+
+DeviceData alloc_device_data(int n) {
+    DeviceData d; d.n = n;
+    size_t size = n * sizeof(double);
+    hipMalloc(&d.qx, size); hipMalloc(&d.qy, size); hipMalloc(&d.qz, size);
+    hipMalloc(&d.vx, size); hipMalloc(&d.vy, size); hipMalloc(&d.vz, size);
+    hipMalloc(&d.m, size);  hipMalloc(&d.is_device, n * sizeof(char));
+    
+    hipMalloc(&d.qx0, size); hipMalloc(&d.qy0, size); hipMalloc(&d.qz0, size);
+    hipMalloc(&d.vx0, size); hipMalloc(&d.vy0, size); hipMalloc(&d.vz0, size);
+    hipMalloc(&d.m0, size);
+
+    hipMalloc(&d.d_result, sizeof(SimResult));
+    return d;
+}
+
+void free_device_data(DeviceData& d) {
+    hipFree(d.qx); hipFree(d.qy); hipFree(d.qz);
+    hipFree(d.vx); hipFree(d.vy); hipFree(d.vz); hipFree(d.m); hipFree(d.is_device);
+    hipFree(d.qx0); hipFree(d.qy0); hipFree(d.qz0);
+    hipFree(d.vx0); hipFree(d.vy0); hipFree(d.vz0); hipFree(d.m0);
+    hipFree(d.d_result);
+}
+
+void copy_to_device(DeviceData& d, const ParticleSystem& h) {
+    size_t size = d.n * sizeof(double);
+    hipMemcpy(d.qx, h.qx.data(), size, hipMemcpyHostToDevice);
+    hipMemcpy(d.qy, h.qy.data(), size, hipMemcpyHostToDevice);
+    hipMemcpy(d.qz, h.qz.data(), size, hipMemcpyHostToDevice);
+    hipMemcpy(d.vx, h.vx.data(), size, hipMemcpyHostToDevice);
+    hipMemcpy(d.vy, h.vy.data(), size, hipMemcpyHostToDevice);
+    hipMemcpy(d.vz, h.vz.data(), size, hipMemcpyHostToDevice);
+    hipMemcpy(d.m,  h.m.data(),  size, hipMemcpyHostToDevice);
+    hipMemcpy(d.is_device, h.is_device.data(), d.n * sizeof(char), hipMemcpyHostToDevice);
+
+    // Backup
+    hipMemcpy(d.qx0, d.qx, size, hipMemcpyDeviceToDevice);
+    hipMemcpy(d.qy0, d.qy, size, hipMemcpyDeviceToDevice);
+    hipMemcpy(d.qz0, d.qz, size, hipMemcpyDeviceToDevice);
+    hipMemcpy(d.vx0, d.vx, size, hipMemcpyDeviceToDevice);
+    hipMemcpy(d.vy0, d.vy, size, hipMemcpyDeviceToDevice);
+    hipMemcpy(d.vz0, d.vz, size, hipMemcpyDeviceToDevice);
+    hipMemcpy(d.m0, d.m, size, hipMemcpyDeviceToDevice);
+}
+
+void reset_device_state(DeviceData& d) {
+    size_t size = d.n * sizeof(double);
+    hipMemcpyAsync(d.qx, d.qx0, size, hipMemcpyDeviceToDevice);
+    hipMemcpyAsync(d.qy, d.qy0, size, hipMemcpyDeviceToDevice);
+    hipMemcpyAsync(d.qz, d.qz0, size, hipMemcpyDeviceToDevice);
+    hipMemcpyAsync(d.vx, d.vx0, size, hipMemcpyDeviceToDevice);
+    hipMemcpyAsync(d.vy, d.vy0, size, hipMemcpyDeviceToDevice);
+    hipMemcpyAsync(d.vz, d.vz0, size, hipMemcpyDeviceToDevice);
+    hipMemcpyAsync(d.m,  d.m0,  size, hipMemcpyDeviceToDevice); // Mass reset is crucial now
+}
+
+SimResult run_simulation_gpu(DeviceData& d, int n_steps, int planet, int asteroid, int target_id) {
+    int tpb = 256;
+    int bpg = (d.n + tpb - 1) / tpb;
+    
+    // Alloc Ax, Ay, Az (Temp)
+    double *d_ax, *d_ay, *d_az;
+    hipMalloc(&d_ax, d.n*8); hipMalloc(&d_ay, d.n*8); hipMalloc(&d_az, d.n*8);
+
+    // Init Result on GPU
+    SimResult initial_res;
+    initial_res.collision_step = -2;
+    initial_res.missile_hit_step = -1;
+    initial_res.min_dist_sq = std::numeric_limits<double>::infinity();
+    
+    // Handle Step 0 Logic (Check initial distance)
+    // We can just launch logic kernel for step 0 without update
+    hipMemcpy(d.d_result, &initial_res, sizeof(SimResult), hipMemcpyHostToDevice);
+    k_logic_check<<<1, 1>>>(d.n, 0, planet, asteroid, target_id, d.qx, d.qy, d.qz, d.m, d.d_result);
+
+    for (int step = 1; step <= n_steps; step++) {
+        double t = step * param::dt; // Force based on previous state
+        
+        // 1. Compute Force
+        k_compute_forces<<<bpg, tpb>>>(d.n, d.qx, d.qy, d.qz, d.m, d.is_device, d_ax, d_ay, d_az, t);
+        
+        // 2. Update Pos
+        k_update_physics<<<bpg, tpb>>>(d.n, param::dt, d.qx, d.qy, d.qz, d.vx, d.vy, d.vz, d_ax, d_ay, d_az);
+        
+        // 3. Logic Check (Missile & Collision)
+        k_logic_check<<<1, 1>>>(d.n, step, planet, asteroid, target_id, d.qx, d.qy, d.qz, d.m, d.d_result);
+    }
+
+    // Retrieve Result ONCE at the end
+    SimResult final_res;
+    hipMemcpy(&final_res, d.d_result, sizeof(SimResult), hipMemcpyDeviceToHost);
+    
+    hipFree(d_ax); hipFree(d_ay); hipFree(d_az);
+    return final_res;
+}
+
 
 ParticleSystem read_input(const char* filename) {
     std::ifstream fin(filename);
-
     ParticleSystem s;
-    int n, planet, asteroid;
-    fin >> n >> planet >> asteroid;
-
-    s.resize(n);
-    s.planet = planet;
-    s.asteroid = asteroid;
-
-    for (int i = 0; i < n; i++) {
+    fin >> s.n >> s.planet >> s.asteroid;
+    s.qx.resize(s.n); s.qy.resize(s.n); s.qz.resize(s.n);
+    s.vx.resize(s.n); s.vy.resize(s.n); s.vz.resize(s.n);
+    s.m.resize(s.n); s.is_device.resize(s.n);
+    for (int i = 0; i < s.n; i++) {
         std::string type;
         fin >> s.qx[i] >> s.qy[i] >> s.qz[i]
             >> s.vx[i] >> s.vy[i] >> s.vz[i]
             >> s.m[i] >> type;
-
-        if (type == "device") {
-            s.is_device[i] = true;
-            s.device_ids.push_back(i);
-        } else {
-            s.is_device[i] = false;
-        }
+        s.is_device[i] = (type == "device" ? 1 : 0);
+        if(s.is_device[i]) s.device_ids.push_back(i);
     }
     return s;
 }
 
-void write_output(const char* filename, double min_dist, int hit_time_step,
-    int gravity_device_id, double missile_cost) {
-    std::ofstream fout(filename);
-    fout << std::scientific << std::setprecision(std::numeric_limits<double>::digits10 + 1) 
-         << min_dist << '\n'
-         << hit_time_step << '\n'
-         << gravity_device_id << ' ' << missile_cost << '\n';
+// P1: Devices Inactive (Mass = 0)
+double solve_problem1(const ParticleSystem& h, DeviceData& d) {
+    // Temp Zero out mass on GPU
+    std::vector<double> m_temp = h.m;
+    for(int id : h.device_ids) m_temp[id] = 0.0;
+    hipMemcpy(d.m, m_temp.data(), d.n * sizeof(double), hipMemcpyHostToDevice);
+    // Note: We don't update d.m0 backup because P2 needs original mass.
+
+    // Run (Target ID -1 means no missile)
+    SimResult res = run_simulation_gpu(d, param::n_steps, h.planet, h.asteroid, -1);
+    return sqrt(res.min_dist_sq);
 }
 
-void run_step(ParticleSystem& s, int step) {
-    const int n = s.n;
-    const double t = step * param::dt;
-
-    // pre-calculate effective device masses
-    std::vector<double> effective_masses = s.m;
-    for (int id : s.device_ids)
-        effective_masses[id] = get_device_mass(s.m[id], t);
-
-    std::vector<double> ax(n, 0.0), ay(n, 0.0), az(n, 0.0);
-
-    for (int i = 0; i < n; i++) {
-        for (int j = 0; j < n; j++) {
-            if (i == j) continue;
-
-            double dx = s.qx[j] - s.qx[i];
-            double dy = s.qy[j] - s.qy[i];
-            double dz = s.qz[j] - s.qz[i];
-            
-            double r2 = dx*dx + dy*dy + dz*dz + param::eps*param::eps;
-            double r = std::sqrt(r2);
-            double r3 = r * r2;
-
-            double f = param::G * effective_masses[j] / r3;
-            ax[i] += f * dx;
-            ay[i] += f * dy;
-            az[i] += f * dz;
-        }
-    }
-
-    for (int i = 0; i < n; i++) {
-        s.vx[i] += ax[i] * param::dt;
-        s.vy[i] += ay[i] * param::dt;
-        s.vz[i] += az[i] * param::dt;
-
-        s.qx[i] += s.vx[i] * param::dt;
-        s.qy[i] += s.vy[i] * param::dt;
-        s.qz[i] += s.vz[i] * param::dt;
-    }
+// P2: Devices Active
+int solve_problem2(const ParticleSystem& h, DeviceData& d) {
+    // Restore Mass (from Backup m0 which is clean from P1's mess)
+    // Actually d.m0 is original input.
+    reset_device_state(d); 
+    
+    SimResult res = run_simulation_gpu(d, param::n_steps, h.planet, h.asteroid, -1);
+    return res.collision_step;
 }
 
-double solve_problem1(ParticleSystem s) {
-    for (int id : s.device_ids)
-        s.m[id] = 0;
+// P3: Batch Worker
+void solve_p3_batch(int gpu_id, const ParticleSystem& h, const std::vector<int>& targets, 
+                    int& best_id, double& min_cost, int p2_hit_step) 
+{
+    hipSetDevice(gpu_id);
+    DeviceData d = alloc_device_data(h.n);
+    copy_to_device(d, h);
 
-    double min_dist = s.disSquared(s.planet, s.asteroid);
-    
-    for (int step = 1; step <= param::n_steps; step++) {
-        run_step(s, step);
-    
-        double d2 = s.disSquared(s.planet, s.asteroid);
-        if (d2 < min_dist)
-            min_dist = d2;
-    }
-    return std::sqrt(min_dist);
-}
+    double local_min_cost = std::numeric_limits<double>::infinity();
+    int local_best_id = -1;
 
-double sovle_problem2(ParticleSystem s) {
-    double r2 = param::planet_radius * param::planet_radius;
-    if (s.disSquared(s.planet, s.asteroid) < r2)
-        return 0;
+    for (int target_id : targets) {
+        reset_device_state(d); // Reset Q, V, and M
+        hipDeviceSynchronize();
 
-    for (int step = 1; step <= param::n_steps; step++) {
-        run_step(s, step);
-    
-        if (s.disSquared(s.planet, s.asteroid) < r2)
-            return step;
-    }
-    return -2;
-}
+        SimResult res = run_simulation_gpu(d, param::n_steps, h.planet, h.asteroid, target_id);
 
-std::pair<int, double> solve_problem3(ParticleSystem& initial_s, int hit_time_step) {
-    if (hit_time_step == -2)
-        return {-1, 0.0};
-    
-    int best_device_id = -1;
-    double min_missile_cost = std::numeric_limits<double>::infinity();
-    double r2 = param::planet_radius * param::planet_radius;
-
-    ParticleSystem s = initial_s;
-    for (int id: initial_s.device_ids) {
-        s.reset_to(initial_s);
-
-        bool destroyed = false;
-        int destroy_step = -1;
-        bool hit_planet = false;
-
-        for (int step = 0; step <= param::n_steps; step++) {
-            // missle logic
-            if (!destroyed) {
-                double dist = s.distance(s.planet, id);
-                double missle_travel_dist = param::missile_speed * (step+1) * param::dt;
-                if (missle_travel_dist >= dist) {  // device destroyed
-                    destroyed = true;
-                    destroy_step = step;
-                    s.m[id] = 0;
+        if (res.collision_step == -2) {
+            if (res.missile_hit_step != -1) {
+                double cost = param::get_missile_cost((res.missile_hit_step + 1) * param::dt);
+                if (cost < local_min_cost) {
+                    local_min_cost = cost;
+                    local_best_id = target_id;
                 }
             }
-
-            if (step > 0) 
-                run_step(s, step);
-
-            // collision check
-            if (s.disSquared(s.planet, s.asteroid) < r2) {
-                hit_planet = true;
-                break;  // fail attempt
-            }
-        }
-
-        if (!hit_planet) {  // successful prevention of collision
-            double missile_cost = param::get_missile_cost((destroy_step + 1) * param::dt);
-            if (missile_cost < min_missile_cost) {
-                min_missile_cost = missile_cost;
-                best_device_id = id;
-            }
         }
     }
-    if (best_device_id == -1)
-        min_missile_cost = 0.0;
 
-    return {best_device_id, min_missile_cost};
+    best_id = local_best_id;
+    min_cost = local_min_cost;
+    free_device_data(d);
 }
 
 int main(int argc, char** argv) {
-    if (argc != 3)
-        throw std::runtime_error("must supply 2 arguments");
+    if (argc != 3) return 1;
+    ParticleSystem host_data = read_input(argv[1]);
 
-    ParticleSystem initial_s = read_input(argv[1]);
+    hipSetDevice(0);
+    DeviceData d0 = alloc_device_data(host_data.n);
+    copy_to_device(d0, host_data);
 
-    double min_dist = solve_problem1(initial_s);
-    int hit_time_step = sovle_problem2(initial_s);
-    auto [best_device_id, min_missile_cost] = solve_problem3(initial_s, hit_time_step);
+    auto start = std::chrono::high_resolution_clock::now();
+    double min_dist = solve_problem1(host_data, d0);
+    auto end_p1 = std::chrono::high_resolution_clock::now();
+    int hit_step = solve_problem2(host_data, d0);
+    auto end_p2 = std::chrono::high_resolution_clock::now();
+    free_device_data(d0);
 
-    write_output(argv[2], min_dist, hit_time_step, best_device_id, min_missile_cost);
+    int best_id = -1; 
+    double min_cost = 0.0;
+
+    if (hit_step != -2) {
+        std::vector<int> batch0, batch1;
+        for(size_t i=0; i<host_data.device_ids.size(); i++) {
+            if (i % 2 == 0) batch0.push_back(host_data.device_ids[i]);
+            else batch1.push_back(host_data.device_ids[i]);
+        }
+
+        int id0, id1; double cost0, cost1;
+        std::thread t0(solve_p3_batch, 0, std::cref(host_data), std::cref(batch0), std::ref(id0), std::ref(cost0), hit_step);
+        std::thread t1(solve_p3_batch, 1, std::cref(host_data), std::cref(batch1), std::ref(id1), std::ref(cost1), hit_step);
+        t0.join(); t1.join();
+
+        if (cost0 < cost1) { best_id = id0; min_cost = cost0; }
+        else { best_id = id1; min_cost = cost1; }
+
+        if (min_cost == std::numeric_limits<double>::infinity()) {
+            best_id = -1; min_cost = 0;
+        }
+    } else {
+        best_id = -1; min_cost = 0; // P2 says no collision initially
+    }
+    auto end_p3 = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> p1_time = end_p1 - start;
+    std::chrono::duration<double> p2_time = end_p2 - end_p1;
+    std::chrono::duration<double> p3_time = end_p3 - end_p2;
+    std::cout << "Problem 1 Time: " << p1_time.count() << " seconds\n";
+    std::cout << "Problem 2 Time: " << p2_time.count() << " seconds\n";
+    std::cout << "Problem 3 Time: " << p3_time.count() << " seconds\n";
+
+    std::ofstream fout(argv[2]);
+    fout << std::scientific << std::setprecision(std::numeric_limits<double>::digits10 + 1) 
+         << min_dist << '\n' << hit_step << '\n' << best_id << ' ' << min_cost << '\n';
     return 0;
 }
