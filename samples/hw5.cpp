@@ -7,16 +7,17 @@
 #include <vector>
 
 namespace param {
-const int n_steps = 200000;
-const double dt = 60;  // time step in seconds
-const double eps = 1e-3;  // soften parameter to avoid singularities
-const double G = 6.674e-11;
-double gravity_device_mass(double m0, double t) {
-    return m0 + 0.5 * m0 * fabs(sin(t / 6000));
-}
-const double planet_radius = 1e7;
-const double missile_speed = 1e6;
-double get_missile_cost(double t) { return 1e5 + 1e3 * t; }
+    const int n_steps = 200000;
+    const double dt = 60;  // time step in seconds
+    const double eps = 1e-3;  // soften parameter to avoid singularities
+    const double eps2 = eps * eps;
+    const double G = 6.674e-11;
+    double gravity_device_mass(double m0, double t) {
+        return m0 + 0.5 * m0 * fabs(sin(t / 6000));
+    }
+    const double planet_radius = 1e7;
+    const double missile_speed = 1e6;
+    double get_missile_cost(double t) { return 1e5 + 1e3 * t; }
 }  // namespace param
 
 struct ParticleSystem {
@@ -37,6 +38,12 @@ struct ParticleSystem {
         vx.resize(size); vy.resize(size); vz.resize(size);
         m.resize(size);
         is_device.resize(size, false);
+    }
+
+    void reset_to(const ParticleSystem& init) {
+        qx = init.qx; qy = init.qy; qz = init.qz;
+        vx = init.vx; vy = init.vy; vz = init.vz;
+        m = init.m;
     }
 
     double disSquared(int i, int j) const {
@@ -92,8 +99,16 @@ void write_output(const char* filename, double min_dist, int hit_time_step,
 }
 
 void run_step(ParticleSystem& s, int step) {
-    int n = s.n;
+    const int n = s.n;
+    const double t = step * param::dt;
+
+    // pre-calculate effective device masses
+    std::vector<double> effective_masses = s.m;
+    for (int id : s.device_ids)
+        effective_masses[id] = get_device_mass(s.m[id], t);
+
     std::vector<double> ax(n, 0.0), ay(n, 0.0), az(n, 0.0);
+
     for (int i = 0; i < n; i++) {
         for (int j = 0; j < n; j++) {
             if (i == j) continue;
@@ -106,12 +121,7 @@ void run_step(ParticleSystem& s, int step) {
             double r = std::sqrt(r2);
             double r3 = r * r2;
 
-            double mj = s.m[j];
-            if (s.is_device[j] && mj > 0) {
-                mj = get_device_mass(mj, step * param::dt);
-            }
-
-            double f = param::G * mj / r3;
+            double f = param::G * effective_masses[j] / r3;
             ax[i] += f * dx;
             ay[i] += f * dy;
             az[i] += f * dz;
@@ -130,14 +140,13 @@ void run_step(ParticleSystem& s, int step) {
 }
 
 double solve_problem1(ParticleSystem s) {
-    double min_dist = std::numeric_limits<double>::infinity();
-    for (int id : s.device_ids) {
+    for (int id : s.device_ids)
         s.m[id] = 0;
-    }
+
+    double min_dist = s.disSquared(s.planet, s.asteroid);
     
-    for (int step = 0; step <= param::n_steps; step++) {
-        if (step > 0) 
-            run_step(s, step);
+    for (int step = 1; step <= param::n_steps; step++) {
+        run_step(s, step);
     
         double d2 = s.disSquared(s.planet, s.asteroid);
         if (d2 < min_dist)
@@ -154,9 +163,8 @@ double sovle_problem2(ParticleSystem s) {
     for (int step = 1; step <= param::n_steps; step++) {
         run_step(s, step);
     
-        if (s.disSquared(s.planet, s.asteroid) < r2) {
+        if (s.disSquared(s.planet, s.asteroid) < r2)
             return step;
-        }
     }
     return -2;
 }
@@ -169,8 +177,9 @@ std::pair<int, double> solve_problem3(ParticleSystem& initial_s, int hit_time_st
     double min_missile_cost = std::numeric_limits<double>::infinity();
     double r2 = param::planet_radius * param::planet_radius;
 
+    ParticleSystem s = initial_s;
     for (int id: initial_s.device_ids) {
-        ParticleSystem s = initial_s;
+        s.reset_to(initial_s);
 
         bool destroyed = false;
         int destroy_step = -1;
