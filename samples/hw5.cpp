@@ -31,7 +31,7 @@ namespace param {
 struct ParticleSystem {
     int n, planet, asteroid;
     std::vector<double> qx, qy, qz, vx, vy, vz, m;
-    std::vector<char> is_device; // Optimized: bool -> char
+    std::vector<char> is_device;
     std::vector<int> device_ids;
 };
 
@@ -49,10 +49,10 @@ struct DeviceData {
     double *m;
     char *is_device;
 
-    // Backup for P3 Reset
+    // Backup for Reset
     double *qx0, *qy0, *qz0;
     double *vx0, *vy0, *vz0;
-    double *m0; // Mass also needs reset in P3 because logic kernel modifies it
+    double *m0; 
 
     // Simulation Status (Device Side)
     SimResult* d_result;
@@ -62,13 +62,36 @@ __device__ inline double get_mass_gpu(double m0, double t) {
     return m0 + 0.5 * m0 * fabs(sin(t / 6000.0));
 }
 
+// ===== Kernels =====
+
+// update mass based on time for device particles
+__global__ void k_update_mass(
+    int n, 
+    const double* __restrict__ m0, // original mass
+    double* __restrict__ m,        // active mass
+    const char* __restrict__ is_device,
+    double t) 
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
+    // If current mass is already 0 (set by P1 or hit by P3), keep it 0 and do not revive it
+    double current_m = m[i];
+    if (current_m == 0.0) return;
+
+    // Only Device particles have time-varying mass
+    if (is_device[i]) {
+        double base_m = m0[i];
+        m[i] = base_m + 0.5 * base_m * fabs(sin(t / 6000.0));
+    }
+}
+
 __global__ void k_compute_forces(
     int n, 
     const double* __restrict__ qx, const double* __restrict__ qy, const double* __restrict__ qz,
-    const double* __restrict__ m, 
-    const char* __restrict__ is_device,
-    double* __restrict__ ax, double* __restrict__ ay, double* __restrict__ az,
-    double t) 
+    const double* __restrict__ m, // updated mass
+    double* __restrict__ ax, double* __restrict__ ay, double* __restrict__ az
+) 
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
@@ -77,7 +100,9 @@ __global__ void k_compute_forces(
     double acc_x = 0.0, acc_y = 0.0, acc_z = 0.0;
 
     for (int j = 0; j < n; j++) {
+        // r2 for i == j will be eps2, resulting in negligible force.
         if (i == j) continue;
+
         double dx = qx[j] - my_qx;
         double dy = qy[j] - my_qy;
         double dz = qz[j] - my_qz;
@@ -85,10 +110,8 @@ __global__ void k_compute_forces(
         double r_inv = rsqrt(r2);
         double r3_inv = r_inv * r_inv * r_inv;
 
-        double mj = m[j];
-        if (mj > 0.0 && is_device[j]) {
-            mj = get_mass_gpu(mj, t);
-        }
+        // read pre-updated mass directly
+        double mj = m[j]; 
 
         double f = param::G * mj * r3_inv;
         acc_x += f * dx;
@@ -124,7 +147,6 @@ __global__ void k_logic_check(
     double dz = qz[planet] - qz[asteroid];
     double d2 = dx*dx + dy*dy + dz*dz;
     
-    // AtomicMin for double is tricky, but single thread logic avoids race conditions here
     if (d2 < result->min_dist_sq) {
         result->min_dist_sq = d2;
     }
@@ -145,10 +167,12 @@ __global__ void k_logic_check(
         
         if (missile_dist >= dist_planet_target) {
             result->missile_hit_step = step;
-            m[target_id] = 0.0; // destroy device, modify Global Memory
+            m[target_id] = 0.0; // destroy device
         }
     }
 }
+
+// ===== Helper Functions =====
 
 DeviceData alloc_device_data(int n) {
     DeviceData d; d.n = n;
@@ -202,94 +226,79 @@ void reset_device_state(DeviceData& d) {
     hipMemcpyAsync(d.vx, d.vx0, size, hipMemcpyDeviceToDevice);
     hipMemcpyAsync(d.vy, d.vy0, size, hipMemcpyDeviceToDevice);
     hipMemcpyAsync(d.vz, d.vz0, size, hipMemcpyDeviceToDevice);
-    hipMemcpyAsync(d.m,  d.m0,  size, hipMemcpyDeviceToDevice); // Mass reset is crucial now
+    hipMemcpyAsync(d.m,  d.m0,  size, hipMemcpyDeviceToDevice);
 }
 
 SimResult run_simulation_gpu(DeviceData& d, int n_steps, int planet, int asteroid, int target_id) {
     int tpb = 256;
     int bpg = (d.n + tpb - 1) / tpb;
     
-    // Alloc Ax, Ay, Az (Temp)
+    // Temp memory for acceleration
     double *d_ax, *d_ay, *d_az;
     hipMalloc(&d_ax, d.n*8); hipMalloc(&d_ay, d.n*8); hipMalloc(&d_az, d.n*8);
 
-    // Init Result on GPU
+    // Init Result
     SimResult initial_res;
     initial_res.collision_step = -2;
     initial_res.missile_hit_step = -1;
     initial_res.min_dist_sq = std::numeric_limits<double>::infinity();
-    
-    // Handle Step 0 Logic (Check initial distance)
-    // We can just launch logic kernel for step 0 without update
     hipMemcpy(d.d_result, &initial_res, sizeof(SimResult), hipMemcpyHostToDevice);
+    
+    // Step 0 check
     k_logic_check<<<1, 1>>>(d.n, 0, planet, asteroid, target_id, d.qx, d.qy, d.qz, d.m, d.d_result);
 
     for (int step = 1; step <= n_steps; step++) {
-        double t = step * param::dt; // Force based on previous state
-        
-        // 1. Compute Force
-        k_compute_forces<<<bpg, tpb>>>(d.n, d.qx, d.qy, d.qz, d.m, d.is_device, d_ax, d_ay, d_az, t);
-        
-        // 2. Update Pos
+        double t = step * param::dt;
+        k_update_mass<<<bpg, tpb>>>(d.n, d.m0, d.m, d.is_device, t);
+        k_compute_forces<<<bpg, tpb>>>(d.n, d.qx, d.qy, d.qz, d.m, d_ax, d_ay, d_az);
         k_update_physics<<<bpg, tpb>>>(d.n, param::dt, d.qx, d.qy, d.qz, d.vx, d.vy, d.vz, d_ax, d_ay, d_az);
-        
-        // 3. Logic Check (Missile & Collision)
         k_logic_check<<<1, 1>>>(d.n, step, planet, asteroid, target_id, d.qx, d.qy, d.qz, d.m, d.d_result);
     }
 
-    // Retrieve Result ONCE at the end
     SimResult final_res;
     hipMemcpy(&final_res, d.d_result, sizeof(SimResult), hipMemcpyDeviceToHost);
-    
     hipFree(d_ax); hipFree(d_ay); hipFree(d_az);
     return final_res;
 }
 
+// ===== Task Workers =====
 
-ParticleSystem read_input(const char* filename) {
-    std::ifstream fin(filename);
-    ParticleSystem s;
-    fin >> s.n >> s.planet >> s.asteroid;
-    s.qx.resize(s.n); s.qy.resize(s.n); s.qz.resize(s.n);
-    s.vx.resize(s.n); s.vy.resize(s.n); s.vz.resize(s.n);
-    s.m.resize(s.n); s.is_device.resize(s.n);
-    for (int i = 0; i < s.n; i++) {
-        std::string type;
-        fin >> s.qx[i] >> s.qy[i] >> s.qz[i]
-            >> s.vx[i] >> s.vy[i] >> s.vz[i]
-            >> s.m[i] >> type;
-        s.is_device[i] = (type == "device" ? 1 : 0);
-        if(s.is_device[i]) s.device_ids.push_back(i);
-    }
-    return s;
-}
+// P1 Worker: GPU 0 (Device masses = 0)
+void task_p1(const ParticleSystem& h, double& out_min_dist) {
+    hipSetDevice(0);
+    DeviceData d = alloc_device_data(h.n);
+    copy_to_device(d, h);
 
-// P1: Devices Inactive (Mass = 0)
-double solve_problem1(const ParticleSystem& h, DeviceData& d) {
-    // Temp Zero out mass on GPU
-    std::vector<double> m_temp = h.m;
-    for(int id : h.device_ids) m_temp[id] = 0.0;
-    hipMemcpy(d.m, m_temp.data(), d.n * sizeof(double), hipMemcpyHostToDevice);
-    // Note: We don't update d.m0 backup because P2 needs original mass.
-
-    // Run (Target ID -1 means no missile)
-    SimResult res = run_simulation_gpu(d, param::n_steps, h.planet, h.asteroid, -1);
-    return sqrt(res.min_dist_sq);
-}
-
-// P2: Devices Active
-int solve_problem2(const ParticleSystem& h, DeviceData& d) {
-    // Restore Mass (from Backup m0 which is clean from P1's mess)
-    // Actually d.m0 is original input.
-    reset_device_state(d); 
+    // Set device mass to 0 for P1
+    std::vector<double> m_mod = h.m;
+    for(int id : h.device_ids) m_mod[id] = 0.0;
+    hipMemcpy(d.m, m_mod.data(), d.n * sizeof(double), hipMemcpyHostToDevice);
+    
+    // Backup is not needed for P1 single run, but simulation uses 'm'
+    // Note: We don't update 'm0' because we don't need to reset inside P1 logic.
     
     SimResult res = run_simulation_gpu(d, param::n_steps, h.planet, h.asteroid, -1);
-    return res.collision_step;
+    out_min_dist = sqrt(res.min_dist_sq);
+    
+    free_device_data(d);
 }
 
-// P3: Batch Worker
-void solve_p3_batch(int gpu_id, const ParticleSystem& h, const std::vector<int>& targets, 
-                    int& best_id, double& min_cost, int p2_hit_step) 
+// P2 Worker: GPU 1 (Normal masses)
+void task_p2(const ParticleSystem& h, int& out_hit_step) {
+    hipSetDevice(1);
+    DeviceData d = alloc_device_data(h.n);
+    copy_to_device(d, h);
+    // No mass modification needed for P2
+    
+    SimResult res = run_simulation_gpu(d, param::n_steps, h.planet, h.asteroid, -1);
+    out_hit_step = res.collision_step;
+    
+    free_device_data(d);
+}
+
+// P3 Batch Worker
+void task_p3(int gpu_id, const ParticleSystem& h, const std::vector<int>& targets, 
+             int& best_id, double& min_cost, int p2_hit_step) 
 {
     hipSetDevice(gpu_id);
     DeviceData d = alloc_device_data(h.n);
@@ -299,12 +308,12 @@ void solve_p3_batch(int gpu_id, const ParticleSystem& h, const std::vector<int>&
     int local_best_id = -1;
 
     for (int target_id : targets) {
-        reset_device_state(d); // Reset Q, V, and M
+        reset_device_state(d); // Reset everything to t=0 state
         hipDeviceSynchronize();
 
         SimResult res = run_simulation_gpu(d, param::n_steps, h.planet, h.asteroid, target_id);
 
-        if (res.collision_step == -2) {
+        if (res.collision_step == -2) { // Saved the planet
             if (res.missile_hit_step != -1) {
                 double cost = param::get_missile_cost((res.missile_hit_step + 1) * param::dt);
                 if (cost < local_min_cost) {
@@ -320,24 +329,47 @@ void solve_p3_batch(int gpu_id, const ParticleSystem& h, const std::vector<int>&
     free_device_data(d);
 }
 
+ParticleSystem read_input(const char* filename) {
+    std::ifstream fin(filename);
+    ParticleSystem s;
+    fin >> s.n >> s.planet >> s.asteroid;
+    s.qx.resize(s.n); s.qy.resize(s.n); s.qz.resize(s.n);
+    s.vx.resize(s.n); s.vy.resize(s.n); s.vz.resize(s.n);
+    s.m.resize(s.n); s.is_device.resize(s.n);
+    for (int i = 0; i < s.n; i++) {
+        std::string type;
+        fin >> s.qx[i] >> s.qy[i] >> s.qz[i]
+            >> s.vx[i] >> s.vy[i] >> s.vz[i]
+            >> s.m[i] >> type;
+        s.is_device[i] = (type == "device" ? 1 : 0);
+        if (s.is_device[i])
+            s.device_ids.push_back(i);
+    }
+    return s;
+}
+
 int main(int argc, char** argv) {
     if (argc != 3) return 1;
     ParticleSystem host_data = read_input(argv[1]);
 
-    hipSetDevice(0);
-    DeviceData d0 = alloc_device_data(host_data.n);
-    copy_to_device(d0, host_data);
+    double min_dist = 0.0;
+    int hit_step = -2;
 
     auto start = std::chrono::high_resolution_clock::now();
-    double min_dist = solve_problem1(host_data, d0);
-    auto end_p1 = std::chrono::high_resolution_clock::now();
-    int hit_step = solve_problem2(host_data, d0);
-    auto end_p2 = std::chrono::high_resolution_clock::now();
-    free_device_data(d0);
+
+    // run P1 (GPU 0) and P2 (GPU 1) in parallel
+    std::thread t_p1(task_p1, std::cref(host_data), std::ref(min_dist));
+    std::thread t_p2(task_p2, std::cref(host_data), std::ref(hit_step));
+    
+    t_p1.join();
+    t_p2.join();
+
+    auto mid = std::chrono::high_resolution_clock::now();
 
     int best_id = -1; 
     double min_cost = 0.0;
 
+    // run P3 only when P2 reports a collision
     if (hit_step != -2) {
         std::vector<int> batch0, batch1;
         for(size_t i=0; i<host_data.device_ids.size(); i++) {
@@ -346,8 +378,9 @@ int main(int argc, char** argv) {
         }
 
         int id0, id1; double cost0, cost1;
-        std::thread t0(solve_p3_batch, 0, std::cref(host_data), std::cref(batch0), std::ref(id0), std::ref(cost0), hit_step);
-        std::thread t1(solve_p3_batch, 1, std::cref(host_data), std::cref(batch1), std::ref(id1), std::ref(cost1), hit_step);
+        // run P3 in parallel (GPU 0 & GPU 1)
+        std::thread t0(task_p3, 0, std::cref(host_data), std::cref(batch0), std::ref(id0), std::ref(cost0), hit_step);
+        std::thread t1(task_p3, 1, std::cref(host_data), std::cref(batch1), std::ref(id1), std::ref(cost1), hit_step);
         t0.join(); t1.join();
 
         if (cost0 < cost1) { best_id = id0; min_cost = cost0; }
@@ -357,14 +390,14 @@ int main(int argc, char** argv) {
             best_id = -1; min_cost = 0;
         }
     } else {
-        best_id = -1; min_cost = 0; // P2 says no collision initially
+        best_id = -1; min_cost = 0;
     }
-    auto end_p3 = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double> p1_time = end_p1 - start;
-    std::chrono::duration<double> p2_time = end_p2 - end_p1;
-    std::chrono::duration<double> p3_time = end_p3 - end_p2;
-    std::cout << "Problem 1 Time: " << p1_time.count() << " seconds\n";
-    std::cout << "Problem 2 Time: " << p2_time.count() << " seconds\n";
+
+    auto end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> p1p2_time = mid - start;
+    std::chrono::duration<double> p3_time = end - mid;
+    
+    std::cout << "P1 & P2 (Parallel) Time: " << p1p2_time.count() << " seconds\n";
     std::cout << "Problem 3 Time: " << p3_time.count() << " seconds\n";
 
     std::ofstream fout(argv[2]);
