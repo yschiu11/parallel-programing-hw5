@@ -1,3 +1,4 @@
+// hw5_optimized.cpp
 #include <hip/hip_runtime.h>
 #include <cmath>
 #include <fstream>
@@ -56,11 +57,10 @@ struct DeviceData {
 
     // Simulation Status (Device Side)
     SimResult* d_result;
-};
 
-__device__ inline double get_mass_gpu(double m0, double t) {
-    return m0 + 0.5 * m0 * fabs(sin(t / 6000.0));
-}
+    // Reused temp arrays for acceleration (avoid repeated alloc/free)
+    double *ax, *ay, *az;
+};
 
 // ===== Kernels =====
 
@@ -75,49 +75,73 @@ __global__ void k_update_mass(
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
 
-    // If current mass is already 0 (set by P1 or hit by P3), keep it 0 and do not revive it
     double current_m = m[i];
     if (current_m == 0.0) return;
 
-    // Only Device particles have time-varying mass
     if (is_device[i]) {
         double base_m = m0[i];
         m[i] = base_m + 0.5 * base_m * fabs(sin(t / 6000.0));
     }
 }
 
-__global__ void k_compute_forces(
-    int n, 
+// Tiled N-body force computation using shared memory
+__global__ void k_compute_forces_tiled(
+    int n,
     const double* __restrict__ qx, const double* __restrict__ qy, const double* __restrict__ qz,
-    const double* __restrict__ m, // updated mass
-    double* __restrict__ ax, double* __restrict__ ay, double* __restrict__ az
-) 
+    const double* __restrict__ m,
+    double* __restrict__ ax, double* __restrict__ ay, double* __restrict__ az)
 {
+    extern __shared__ double s_mem[]; // dynamic shared: qx,qy,qz,m (tile_size each)
+    double* s_qx = s_mem;
+    double* s_qy = s_qx + blockDim.x;
+    double* s_qz = s_qy + blockDim.x;
+    double* s_m  = s_qz + blockDim.x;
+
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
 
-    double my_qx = qx[i], my_qy = qy[i], my_qz = qz[i];
+    double my_qx = qx[i];
+    double my_qy = qy[i];
+    double my_qz = qz[i];
+
     double acc_x = 0.0, acc_y = 0.0, acc_z = 0.0;
 
-    for (int j = 0; j < n; j++) {
-        // r2 for i == j will be eps2, resulting in negligible force.
-        if (i == j) continue;
+    int tiles = (n + blockDim.x - 1) / blockDim.x;
+    for (int tile = 0; tile < tiles; ++tile) {
+        int idx = tile * blockDim.x + threadIdx.x;
+        if (idx < n) {
+            s_qx[threadIdx.x] = qx[idx];
+            s_qy[threadIdx.x] = qy[idx];
+            s_qz[threadIdx.x] = qz[idx];
+            s_m[ threadIdx.x] = m[idx];
+        } else {
+            s_qx[threadIdx.x] = 0.0;
+            s_qy[threadIdx.x] = 0.0;
+            s_qz[threadIdx.x] = 0.0;
+            s_m[ threadIdx.x] = 0.0;
+        }
+        __syncthreads();
 
-        double dx = qx[j] - my_qx;
-        double dy = qy[j] - my_qy;
-        double dz = qz[j] - my_qz;
-        double r2 = dx*dx + dy*dy + dz*dz + param::eps2;
-        double r_inv = rsqrt(r2);
-        double r3_inv = r_inv * r_inv * r_inv;
-
-        // read pre-updated mass directly
-        double mj = m[j]; 
-
-        double f = param::G * mj * r3_inv;
-        acc_x += f * dx;
-        acc_y += f * dy;
-        acc_z += f * dz;
+        int limit = min(blockDim.x, n - tile * blockDim.x);
+        int base_j = tile * blockDim.x;
+        for (int k = 0; k < limit; ++k) {
+            int j = base_j + k;
+            if (j == i) continue;
+            double dx = s_qx[k] - my_qx;
+            double dy = s_qy[k] - my_qy;
+            double dz = s_qz[k] - my_qz;
+            double r2 = dx*dx + dy*dy + dz*dz + param::eps2;
+            double inv_r = rsqrt(r2);
+            double inv_r3 = inv_r * inv_r * inv_r;
+            double mj = s_m[k];
+            double f = param::G * mj * inv_r3;
+            acc_x += f * dx;
+            acc_y += f * dy;
+            acc_z += f * dz;
+        }
+        __syncthreads();
     }
+
     ax[i] = acc_x; ay[i] = acc_y; az[i] = acc_z;
 }
 
@@ -177,15 +201,18 @@ __global__ void k_logic_check(
 DeviceData alloc_device_data(int n) {
     DeviceData d; d.n = n;
     size_t size = n * sizeof(double);
-    hipMalloc(&d.qx, size); hipMalloc(&d.qy, size); hipMalloc(&d.qz, size);
-    hipMalloc(&d.vx, size); hipMalloc(&d.vy, size); hipMalloc(&d.vz, size);
-    hipMalloc(&d.m, size);  hipMalloc(&d.is_device, n * sizeof(char));
+    CHECK_HIP(hipMalloc(&d.qx, size)); CHECK_HIP(hipMalloc(&d.qy, size)); CHECK_HIP(hipMalloc(&d.qz, size));
+    CHECK_HIP(hipMalloc(&d.vx, size)); CHECK_HIP(hipMalloc(&d.vy, size)); CHECK_HIP(hipMalloc(&d.vz, size));
+    CHECK_HIP(hipMalloc(&d.m, size));  CHECK_HIP(hipMalloc(&d.is_device, n * sizeof(char)));
     
-    hipMalloc(&d.qx0, size); hipMalloc(&d.qy0, size); hipMalloc(&d.qz0, size);
-    hipMalloc(&d.vx0, size); hipMalloc(&d.vy0, size); hipMalloc(&d.vz0, size);
-    hipMalloc(&d.m0, size);
+    CHECK_HIP(hipMalloc(&d.qx0, size)); CHECK_HIP(hipMalloc(&d.qy0, size)); CHECK_HIP(hipMalloc(&d.qz0, size));
+    CHECK_HIP(hipMalloc(&d.vx0, size)); CHECK_HIP(hipMalloc(&d.vy0, size)); CHECK_HIP(hipMalloc(&d.vz0, size));
+    CHECK_HIP(hipMalloc(&d.m0, size));
 
-    hipMalloc(&d.d_result, sizeof(SimResult));
+    CHECK_HIP(hipMalloc(&d.d_result, sizeof(SimResult)));
+
+    // allocate acceleration buffers once and reuse
+    CHECK_HIP(hipMalloc(&d.ax, size)); CHECK_HIP(hipMalloc(&d.ay, size)); CHECK_HIP(hipMalloc(&d.az, size));
     return d;
 }
 
@@ -195,27 +222,28 @@ void free_device_data(DeviceData& d) {
     hipFree(d.qx0); hipFree(d.qy0); hipFree(d.qz0);
     hipFree(d.vx0); hipFree(d.vy0); hipFree(d.vz0); hipFree(d.m0);
     hipFree(d.d_result);
+    hipFree(d.ax); hipFree(d.ay); hipFree(d.az);
 }
 
 void copy_to_device(DeviceData& d, const ParticleSystem& h) {
     size_t size = d.n * sizeof(double);
-    hipMemcpy(d.qx, h.qx.data(), size, hipMemcpyHostToDevice);
-    hipMemcpy(d.qy, h.qy.data(), size, hipMemcpyHostToDevice);
-    hipMemcpy(d.qz, h.qz.data(), size, hipMemcpyHostToDevice);
-    hipMemcpy(d.vx, h.vx.data(), size, hipMemcpyHostToDevice);
-    hipMemcpy(d.vy, h.vy.data(), size, hipMemcpyHostToDevice);
-    hipMemcpy(d.vz, h.vz.data(), size, hipMemcpyHostToDevice);
-    hipMemcpy(d.m,  h.m.data(),  size, hipMemcpyHostToDevice);
-    hipMemcpy(d.is_device, h.is_device.data(), d.n * sizeof(char), hipMemcpyHostToDevice);
+    CHECK_HIP(hipMemcpy(d.qx, h.qx.data(), size, hipMemcpyHostToDevice));
+    CHECK_HIP(hipMemcpy(d.qy, h.qy.data(), size, hipMemcpyHostToDevice));
+    CHECK_HIP(hipMemcpy(d.qz, h.qz.data(), size, hipMemcpyHostToDevice));
+    CHECK_HIP(hipMemcpy(d.vx, h.vx.data(), size, hipMemcpyHostToDevice));
+    CHECK_HIP(hipMemcpy(d.vy, h.vy.data(), size, hipMemcpyHostToDevice));
+    CHECK_HIP(hipMemcpy(d.vz, h.vz.data(), size, hipMemcpyHostToDevice));
+    CHECK_HIP(hipMemcpy(d.m,  h.m.data(),  size, hipMemcpyHostToDevice));
+    CHECK_HIP(hipMemcpy(d.is_device, h.is_device.data(), d.n * sizeof(char), hipMemcpyHostToDevice));
 
-    // Backup
-    hipMemcpy(d.qx0, d.qx, size, hipMemcpyDeviceToDevice);
-    hipMemcpy(d.qy0, d.qy, size, hipMemcpyDeviceToDevice);
-    hipMemcpy(d.qz0, d.qz, size, hipMemcpyDeviceToDevice);
-    hipMemcpy(d.vx0, d.vx, size, hipMemcpyDeviceToDevice);
-    hipMemcpy(d.vy0, d.vy, size, hipMemcpyDeviceToDevice);
-    hipMemcpy(d.vz0, d.vz, size, hipMemcpyDeviceToDevice);
-    hipMemcpy(d.m0, d.m, size, hipMemcpyDeviceToDevice);
+    // Backup (device -> device)
+    CHECK_HIP(hipMemcpy(d.qx0, d.qx, size, hipMemcpyDeviceToDevice));
+    CHECK_HIP(hipMemcpy(d.qy0, d.qy, size, hipMemcpyDeviceToDevice));
+    CHECK_HIP(hipMemcpy(d.qz0, d.qz, size, hipMemcpyDeviceToDevice));
+    CHECK_HIP(hipMemcpy(d.vx0, d.vx, size, hipMemcpyDeviceToDevice));
+    CHECK_HIP(hipMemcpy(d.vy0, d.vy, size, hipMemcpyDeviceToDevice));
+    CHECK_HIP(hipMemcpy(d.vz0, d.vz, size, hipMemcpyDeviceToDevice));
+    CHECK_HIP(hipMemcpy(d.m0, d.m, size, hipMemcpyDeviceToDevice));
 }
 
 void reset_device_state(DeviceData& d) {
@@ -229,35 +257,36 @@ void reset_device_state(DeviceData& d) {
     hipMemcpyAsync(d.m,  d.m0,  size, hipMemcpyDeviceToDevice);
 }
 
+// Run simulation on GPU with preallocated acceleration buffers in DeviceData
 SimResult run_simulation_gpu(DeviceData& d, int n_steps, int planet, int asteroid, int target_id) {
     int tpb = 256;
     int bpg = (d.n + tpb - 1) / tpb;
     
-    // Temp memory for acceleration
-    double *d_ax, *d_ay, *d_az;
-    hipMalloc(&d_ax, d.n*8); hipMalloc(&d_ay, d.n*8); hipMalloc(&d_az, d.n*8);
-
     // Init Result
     SimResult initial_res;
     initial_res.collision_step = -2;
     initial_res.missile_hit_step = -1;
     initial_res.min_dist_sq = std::numeric_limits<double>::infinity();
-    hipMemcpy(d.d_result, &initial_res, sizeof(SimResult), hipMemcpyHostToDevice);
+    CHECK_HIP(hipMemcpy(d.d_result, &initial_res, sizeof(SimResult), hipMemcpyHostToDevice));
     
     // Step 0 check
     k_logic_check<<<1, 1>>>(d.n, 0, planet, asteroid, target_id, d.qx, d.qy, d.qz, d.m, d.d_result);
 
+    // compute shared memory size for tiled kernel
+    size_t shared_bytes = tpb * 4 * sizeof(double); // qx,qy,qz,m
+
     for (int step = 1; step <= n_steps; step++) {
         double t = step * param::dt;
         k_update_mass<<<bpg, tpb>>>(d.n, d.m0, d.m, d.is_device, t);
-        k_compute_forces<<<bpg, tpb>>>(d.n, d.qx, d.qy, d.qz, d.m, d_ax, d_ay, d_az);
-        k_update_physics<<<bpg, tpb>>>(d.n, param::dt, d.qx, d.qy, d.qz, d.vx, d.vy, d.vz, d_ax, d_ay, d_az);
+        // tiled compute forces
+        hipLaunchKernelGGL(k_compute_forces_tiled, dim3(bpg), dim3(tpb), shared_bytes, 0, 
+                           d.n, d.qx, d.qy, d.qz, d.m, d.ax, d.ay, d.az);
+        k_update_physics<<<bpg, tpb>>>(d.n, param::dt, d.qx, d.qy, d.qz, d.vx, d.vy, d.vz, d.ax, d.ay, d.az);
         k_logic_check<<<1, 1>>>(d.n, step, planet, asteroid, target_id, d.qx, d.qy, d.qz, d.m, d.d_result);
     }
 
     SimResult final_res;
-    hipMemcpy(&final_res, d.d_result, sizeof(SimResult), hipMemcpyDeviceToHost);
-    hipFree(d_ax); hipFree(d_ay); hipFree(d_az);
+    CHECK_HIP(hipMemcpy(&final_res, d.d_result, sizeof(SimResult), hipMemcpyDeviceToHost));
     return final_res;
 }
 
@@ -265,17 +294,14 @@ SimResult run_simulation_gpu(DeviceData& d, int n_steps, int planet, int asteroi
 
 // P1 Worker: GPU 0 (Device masses = 0)
 void task_p1(const ParticleSystem& h, double& out_min_dist) {
-    hipSetDevice(0);
+    CHECK_HIP(hipSetDevice(0));
     DeviceData d = alloc_device_data(h.n);
     copy_to_device(d, h);
 
-    // Set device mass to 0 for P1
+    // Set device mass to 0 for P1 (active mass)
     std::vector<double> m_mod = h.m;
     for(int id : h.device_ids) m_mod[id] = 0.0;
-    hipMemcpy(d.m, m_mod.data(), d.n * sizeof(double), hipMemcpyHostToDevice);
-    
-    // Backup is not needed for P1 single run, but simulation uses 'm'
-    // Note: We don't update 'm0' because we don't need to reset inside P1 logic.
+    CHECK_HIP(hipMemcpy(d.m, m_mod.data(), d.n * sizeof(double), hipMemcpyHostToDevice));
     
     SimResult res = run_simulation_gpu(d, param::n_steps, h.planet, h.asteroid, -1);
     out_min_dist = sqrt(res.min_dist_sq);
@@ -285,7 +311,7 @@ void task_p1(const ParticleSystem& h, double& out_min_dist) {
 
 // P2 Worker: GPU 1 (Normal masses)
 void task_p2(const ParticleSystem& h, int& out_hit_step) {
-    hipSetDevice(1);
+    CHECK_HIP(hipSetDevice(1));
     DeviceData d = alloc_device_data(h.n);
     copy_to_device(d, h);
     // No mass modification needed for P2
@@ -300,7 +326,7 @@ void task_p2(const ParticleSystem& h, int& out_hit_step) {
 void task_p3(int gpu_id, const ParticleSystem& h, const std::vector<int>& targets, 
              int& best_id, double& min_cost, int p2_hit_step) 
 {
-    hipSetDevice(gpu_id);
+    CHECK_HIP(hipSetDevice(gpu_id));
     DeviceData d = alloc_device_data(h.n);
     copy_to_device(d, h);
 
@@ -309,7 +335,7 @@ void task_p3(int gpu_id, const ParticleSystem& h, const std::vector<int>& target
 
     for (int target_id : targets) {
         reset_device_state(d); // Reset everything to t=0 state
-        hipDeviceSynchronize();
+        hipDeviceSynchronize(); // ensure reset completed
 
         SimResult res = run_simulation_gpu(d, param::n_steps, h.planet, h.asteroid, target_id);
 
@@ -377,7 +403,8 @@ int main(int argc, char** argv) {
             else batch1.push_back(host_data.device_ids[i]);
         }
 
-        int id0, id1; double cost0, cost1;
+        int id0 = -1, id1 = -1; 
+        double cost0 = std::numeric_limits<double>::infinity(), cost1 = std::numeric_limits<double>::infinity();
         // run P3 in parallel (GPU 0 & GPU 1)
         std::thread t0(task_p3, 0, std::cref(host_data), std::cref(batch0), std::ref(id0), std::ref(cost0), hit_step);
         std::thread t1(task_p3, 1, std::cref(host_data), std::cref(batch1), std::ref(id1), std::ref(cost1), hit_step);
